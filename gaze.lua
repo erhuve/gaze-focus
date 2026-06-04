@@ -11,9 +11,10 @@
 -- will switch to before you commit. (The commit itself flashes bright cyan.)
 --
 -- Triggers wired up below:
---   * mouse4 (the "back" thumb button) -- no remapping needed
---   * hotkey  cmd+alt+ctrl+G           -- commit / focus the candidate
---   * hotkey  cmd+alt+ctrl+P           -- toggle the live candidate preview
+--   * a keyboard key  (default: F13 / Print Screen -- see TRIGGER_KEY)
+--   * hotkey  cmd+alt+ctrl+G  -- commit / focus the candidate (backup)
+--   * hotkey  cmd+alt+ctrl+P  -- toggle the live candidate preview
+--   * hotkey  cmd+alt+ctrl+K  -- toggle the key detector (find a key's name)
 --
 -- Install: put this file at ~/.hammerspoon/gaze.lua and add this line to
 -- ~/.hammerspoon/init.lua:   require("gaze")
@@ -250,18 +251,52 @@ hs.hotkey.bind({ "cmd", "alt", "ctrl" }, "p", function()
   hs.alert.show("gaze preview: " .. (PREVIEW_ENABLED and "on" or "off"))
 end)
 
--- Hotkey trigger (change the mods/key to taste)
+-- ── Commit trigger ──────────────────────────────────────────────────────────
+-- The key that commits focus to the candidate window. Good "dead" keys on
+-- macOS that won't clash with anything: Print Screen, Scroll Lock, Pause. AVOID
+-- Home / End / Page Up / Page Down -- you use those constantly for scrolling and
+-- cursor movement, so binding one would break normal typing.
+--
+-- TRIGGER_KEY takes a Hammerspoon key name (e.g. "f13", "pause", "f14") OR a raw
+-- keycode number (e.g. 113). Most PC keyboards on a Mac send F13/F14/F15 from the
+-- Print Screen / Scroll Lock / Pause cluster -- so "f13" is the default.
+--
+-- Not sure what your key sends? Press cmd+alt+ctrl+K to turn on the detector, tap
+-- your key, and an alert (+ the Hammerspoon console) shows its name and keycode.
+-- Put that here: the name if one is shown, otherwise the raw number.
+local TRIGGER_KEY = "f13"
+local TRIGGER_MODS = {} -- e.g. { "cmd", "alt" } for a chord; {} for a bare key
+
+local triggerHotkey = hs.hotkey.bind(TRIGGER_MODS, TRIGGER_KEY, commit)
+if not triggerHotkey then
+  hs.alert.show("gaze: trigger key '" .. tostring(TRIGGER_KEY) ..
+    "' not recognized -- use the detector (cmd+alt+ctrl+K)")
+end
+
+-- Backup hotkey, always available regardless of TRIGGER_KEY.
 hs.hotkey.bind({ "cmd", "alt", "ctrl" }, "g", commit)
 
--- Mouse4 (back button) trigger. buttonNumber 3 = mouse4, 4 = mouse5.
-M.mouseTap = hs.eventtap.new({ hs.eventtap.event.types.otherMouseDown }, function(e)
-  local btn = e:getProperty(hs.eventtap.event.properties.mouseEventButtonNumber)
-  if btn == 3 then
-    commit()
+-- Key detector: toggle with cmd+alt+ctrl+K, then press a key to see its name +
+-- keycode so you know what to set TRIGGER_KEY to. Off by default; it never
+-- swallows keys, so normal typing is unaffected while it's on.
+local keyDetector = nil
+hs.hotkey.bind({ "cmd", "alt", "ctrl" }, "k", function()
+  if keyDetector then
+    keyDetector:stop(); keyDetector = nil
+    hs.alert.show("gaze key detector: off")
+    return
   end
-  return false -- don't swallow the event
+  keyDetector = hs.eventtap.new({ hs.eventtap.event.types.keyDown }, function(e)
+    local code = e:getKeyCode()
+    local name = hs.keycodes.map[code]
+    local label = name and ('"' .. name .. '"') or ("keycode " .. code)
+    print(string.format("[gaze] key pressed: name=%s keycode=%d", tostring(name), code))
+    hs.alert.show("gaze: this key is " .. label)
+    return false -- never swallow the key
+  end)
+  keyDetector:start()
+  hs.alert.show("gaze key detector: ON -- press your key")
 end)
-M.mouseTap:start()
 
 hs.alert.show("gaze-focus loaded")
 

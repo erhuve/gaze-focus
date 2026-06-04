@@ -10,8 +10,8 @@ pick which one. Two pieces:
   vertical **eye gaze** from your irises, so once you calibrate a screen's split
   it emits a continuous `gaze_y` (`0`=top … `1`=bottom). It *never* moves focus
   on its own.
-- **`gaze.lua`** — Hammerspoon module. On your trigger (mouse4 or a hotkey) it
-  reads the zone, focuses the monitor you're pointed at, and — when `gaze_y` is
+- **`gaze.lua`** — Hammerspoon module. On your trigger key (default F13 / Print
+  Screen) it reads the zone, focuses the monitor you're pointed at, and — when `gaze_y` is
   live and that screen holds 2+ windows — the exact window at that height. Brief
   cyan flash around whatever it focused.
 
@@ -87,13 +87,17 @@ Other keys: `q` / `ESC` quit. Flags: `--camera N`, `--no-preview`, `--fps N`.
 4. Grant permissions when prompted:
    - **Accessibility** (System Settings → Privacy & Security → Accessibility) so
      it can move focus.
-   - **Input Monitoring** so it can read the mouse4 button.
+   - **Input Monitoring** so the key detector (**⌘⌥⌃K**) can read raw keystrokes.
 
 ## 3. Use it
 
-- **mouse4** (thumb "back" button) → focus the monitor you're pointed at.
-- **⌘⌥⌃G** → same thing via keyboard. Change the binding at the bottom of
-  `gaze.lua` to any key/combo you want.
+- **F13 / Print Screen** (the default trigger) → focus the monitor you're pointed
+  at. Set `TRIGGER_KEY` near the bottom of `gaze.lua` to any key you like — good
+  dead keys are Print Screen, Scroll Lock, and Pause. Avoid Home/End/PgUp/PgDn,
+  which you use for scrolling.
+- **Not sure what your key sends?** Press **⌘⌥⌃K** to turn on the key detector,
+  tap the key, and an alert shows its name + keycode — put that in `TRIGGER_KEY`.
+- **⌘⌥⌃G** → same commit via a keyboard chord, always available as a backup.
 
 Point your head, tap the trigger, focus follows. Whatever it focuses (a screen,
 or a single window when eye gaze is live) flashes cyan so you get instant
@@ -102,7 +106,7 @@ the window your eyes are on; otherwise it focuses the frontmost window there.
 
 **Live candidate preview:** while you look around, a steady **amber** outline
 follows the window your gaze is currently on — but only when that window *isn't
-already focused*. It's a preview of exactly what mouse4 will switch to, so you
+already focused*. It's a preview of exactly what the trigger will switch to, so you
 can confirm before you commit. The moment you commit, the amber preview gives way
 to the bright cyan confirmation flash. Toggle the preview on/off with **⌘⌥⌃P** if
 you ever find it distracting. (The outline is click-through and never steals
@@ -134,7 +138,7 @@ to see the names).
   blink-guarded; Hammerspoon maps it to the window at that height on the screen.
 - **Hysteresis** (the stickiness margin) keeps the zone stable near boundaries,
   so it's settled by the time you press the trigger. Tune with `[` / `]`.
-- To swap the trigger to a real **foot pedal** later, just map the pedal to
-  ⌘⌥⌃G (or any key) and you're done — no code change.
+- To swap the trigger to a real **foot pedal** later, map the pedal to whatever
+  key you set in `TRIGGER_KEY` (or to ⌘⌥⌃G) and you're done — no code change.
 - Want focus to follow automatically without a trigger? That's the thrashy mode
   we deliberately avoided, but it's a few lines if you change your mind.
