@@ -100,6 +100,14 @@ or a single window when eye gaze is live) flashes cyan so you get instant
 "switched here" feedback. On a screen with a calibrated top/bottom split it picks
 the window your eyes are on; otherwise it focuses the frontmost window there.
 
+**Live candidate preview:** while you look around, a steady **amber** outline
+follows the window your gaze is currently on — but only when that window *isn't
+already focused*. It's a preview of exactly what mouse4 will switch to, so you
+can confirm before you commit. The moment you commit, the amber preview gives way
+to the bright cyan confirmation flash. Toggle the preview on/off with **⌘⌥⌃P** if
+you ever find it distracting. (The outline is click-through and never steals
+focus on its own.)
+
 `gaze.lua` figures out which physical screen each zone is automatically: the
 **right** zone → your rightmost display; of the remaining two, the higher one →
 **top**, the lower one → **laptop**. If macOS has your displays arranged so that

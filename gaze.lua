@@ -6,9 +6,14 @@
 -- On a trigger this focuses the matching physical screen -- and if gaze_y is
 -- present and the screen holds 2+ windows, the exact window at that height.
 --
+-- It also draws a live amber "candidate" outline around the window your gaze is
+-- on whenever that window ISN'T already focused -- so you can see what mouse4
+-- will switch to before you commit. (The commit itself flashes bright cyan.)
+--
 -- Triggers wired up below:
 --   * mouse4 (the "back" thumb button) -- no remapping needed
---   * hotkey  cmd+alt+ctrl+G           -- change to whatever you like
+--   * hotkey  cmd+alt+ctrl+G           -- commit / focus the candidate
+--   * hotkey  cmd+alt+ctrl+P           -- toggle the live candidate preview
 --
 -- Install: put this file at ~/.hammerspoon/gaze.lua and add this line to
 -- ~/.hammerspoon/init.lua:   require("gaze")
@@ -19,6 +24,12 @@ local M = {}
 local STATE_PATH = os.getenv("HOME") .. "/.gaze/state.json"
 local FLASH_SECONDS = 0.25
 local STALE_SECONDS = 3.0 -- ignore state.json if the service isn't updating it
+
+-- Live candidate preview (the outline that follows your gaze before you commit).
+local PREVIEW_ENABLED = true
+local PREVIEW_HZ = 10 -- how often to recheck the candidate window
+local FLASH_COLOR = { red = 0.23, green = 0.86, blue = 1.0, alpha = 0.95 } -- commit
+local PREVIEW_COLOR = { red = 1.0, green = 0.75, blue = 0.15, alpha = 0.95 } -- candidate
 
 -- Optional hard override: map a zone to a screen by (partial) name. Leave a
 -- value as nil to auto-detect. Find names with `hs.inspect(hs.screen.allScreens())`
@@ -105,11 +116,12 @@ local function flashFrame(rect)
   c:appendElements({
     type = "rectangle",
     action = "stroke",
-    strokeColor = { red = 0.23, green = 0.86, blue = 1.0, alpha = 0.95 },
+    strokeColor = FLASH_COLOR,
     strokeWidth = 8,
     roundedRectRadii = { xRadius = 10, yRadius = 10 },
     frame = { x = 0, y = 0, w = rect.w, h = rect.h },
   })
+  c:canvasMouseEvents(false, false, false, false) -- never eat clicks
   c:show()
   hs.timer.doAfter(FLASH_SECONDS, function() c:delete() end)
 end
@@ -138,25 +150,65 @@ local function windowAtGaze(wins, gazeY)
   return best
 end
 
-local function focusZone(zone, gazeY)
-  if not zone or zone < 0 or zone > 2 then return end
-  local target = resolveScreens()[zone]
-  if not target then return end
-
-  -- visible standard windows on the target screen, front-to-back
+-- visible standard windows on a screen, front-to-back
+local function windowsOnScreen(target)
   local wins = {}
   for _, w in ipairs(hs.window.orderedWindows()) do
     if w:screen():id() == target:id() and w:isStandard() then
       wins[#wins + 1] = w
     end
   end
+  return wins
+end
 
-  if #wins == 0 then
+-- The window a commit would focus right now. Returns (window, targetScreen);
+-- window is nil if the target screen has no windows.
+local function candidate(zone, gazeY)
+  if not zone or zone < 0 or zone > 2 then return nil, nil end
+  local target = resolveScreens()[zone]
+  if not target then return nil, nil end
+  local wins = windowsOnScreen(target)
+  if #wins == 0 then return nil, target end
+  return (windowAtGaze(wins, gazeY) or wins[1]), target -- gaze, else frontmost
+end
+
+-- Persistent amber outline around the current candidate window.
+local previewCanvas, previewSig = nil, nil
+
+local function hidePreview()
+  if previewCanvas then previewCanvas:delete(); previewCanvas = nil end
+  previewSig = nil
+end
+
+local function showPreview(win)
+  local f = win:frame()
+  local sig = string.format("%d:%.0f:%.0f:%.0f:%.0f", win:id(), f.x, f.y, f.w, f.h)
+  if sig == previewSig then return end -- already outlining this exact frame
+  hidePreview()
+  local c = hs.canvas.new(f)
+  c:appendElements({
+    type = "rectangle",
+    action = "stroke",
+    strokeColor = PREVIEW_COLOR,
+    strokeWidth = 6,
+    roundedRectRadii = { xRadius = 10, yRadius = 10 },
+    frame = { x = 0, y = 0, w = f.w, h = f.h },
+  })
+  c:level(hs.canvas.windowLevels.floating)
+  c:canvasMouseEvents(false, false, false, false) -- click-through
+  c:clickActivating(false)
+  c:show()
+  previewCanvas, previewSig = c, sig
+end
+
+local function focusZone(zone, gazeY)
+  local pick, target = candidate(zone, gazeY)
+  if not target then return end
+  hidePreview()
+  if not pick then
     flashFrame(target:fullFrame()) -- nothing there; still flash for feedback
     return
   end
-
-  local pick = windowAtGaze(wins, gazeY) or wins[1] -- gaze, else frontmost
   pick:focus()
   flashFrame(pick:frame())
 end
@@ -170,6 +222,33 @@ local function commit()
   end
   focusZone(zone, gy)
 end
+
+-- Live preview tick: outline the candidate window, but only when it isn't the
+-- one already focused (no point previewing where you already are).
+local function updatePreview()
+  if not PREVIEW_ENABLED then hidePreview(); return end
+  local zone, ts, gy = readState()
+  if zone == nil or (ts and (os.time() - ts) > STALE_SECONDS) then
+    hidePreview(); return
+  end
+  local pick = candidate(zone, gy)
+  if not pick then hidePreview(); return end
+  local focused = hs.window.focusedWindow()
+  if focused and pick:id() == focused:id() then
+    hidePreview() -- already focused; nothing to preview
+  else
+    showPreview(pick)
+  end
+end
+
+M.previewTimer = hs.timer.doEvery(1.0 / PREVIEW_HZ, updatePreview)
+
+-- Toggle the live candidate preview on/off.
+hs.hotkey.bind({ "cmd", "alt", "ctrl" }, "p", function()
+  PREVIEW_ENABLED = not PREVIEW_ENABLED
+  if not PREVIEW_ENABLED then hidePreview() end
+  hs.alert.show("gaze preview: " .. (PREVIEW_ENABLED and "on" or "off"))
+end)
 
 -- Hotkey trigger (change the mods/key to taste)
 hs.hotkey.bind({ "cmd", "alt", "ctrl" }, "g", commit)
