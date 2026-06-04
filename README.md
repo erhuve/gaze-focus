@@ -23,6 +23,8 @@ python head_pose_service.py
 ```
 
 First run macOS will ask for **Camera** access for your terminal — allow it.
+On first launch it also downloads a small (~3.8 MB) face-landmark model to
+`~/.gaze/face_landmarker.task`, so you'll need internet that one time.
 
 A preview window opens. Tune it once:
 

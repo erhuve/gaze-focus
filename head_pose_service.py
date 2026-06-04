@@ -27,15 +27,23 @@ import argparse
 import json
 import os
 import time
+import urllib.request
 
 import cv2
 import numpy as np
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
 HOME = os.path.expanduser("~")
 GAZE_DIR = os.path.join(HOME, ".gaze")
 STATE_PATH = os.path.join(GAZE_DIR, "state.json")
 CONFIG_PATH = os.path.join(GAZE_DIR, "config.json")
+MODEL_PATH = os.path.join(GAZE_DIR, "face_landmarker.task")
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
 
 # MediaPipe FaceMesh landmark indices
 NOSE = 1
@@ -69,6 +77,19 @@ def write_state(zone, offset):
     with open(tmp, "w") as f:
         json.dump({"zone": zone, "offset": round(float(offset), 4), "ts": time.time()}, f)
     os.replace(tmp, STATE_PATH)
+
+
+def ensure_model():
+    """Download the FaceLandmarker model bundle on first run."""
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 0:
+        return MODEL_PATH
+    os.makedirs(GAZE_DIR, exist_ok=True)
+    print(f"downloading face landmark model -> {MODEL_PATH} ...")
+    tmp = MODEL_PATH + ".tmp"
+    urllib.request.urlretrieve(MODEL_URL, tmp)
+    os.replace(tmp, MODEL_PATH)
+    print("model ready.")
+    return MODEL_PATH
 
 
 def head_offset(landmarks):
@@ -149,12 +170,14 @@ def main():
     if not cap.isOpened():
         raise SystemExit(f"Could not open camera {args.camera}")
 
-    face_mesh = mp.solutions.face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
+    model_path = ensure_model()
+    options = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=model_path),
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_faces=1,
     )
+    landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+    ts_ms = 0
 
     zone = 1
     last_raw_offset = 0.0
@@ -171,12 +194,13 @@ def main():
                 continue
             frame = cv2.flip(frame, 1)  # mirror so preview feels natural
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb.flags.writeable = False
-            results = face_mesh.process(rgb)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            ts_ms += 1
+            result = landmarker.detect_for_video(mp_image, ts_ms)
 
             offset = last_raw_offset
-            if results.multi_face_landmarks:
-                lm = results.multi_face_landmarks[0].landmark
+            if result.face_landmarks:
+                lm = result.face_landmarks[0]
                 offset = head_offset(lm)
                 last_raw_offset = offset
 
@@ -215,7 +239,7 @@ def main():
         cap.release()
         if not args.no_preview:
             cv2.destroyAllWindows()
-        face_mesh.close()
+        landmarker.close()
 
 
 if __name__ == "__main__":
