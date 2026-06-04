@@ -45,9 +45,10 @@ Hammerspoon when you press your trigger (mouse4 or a hotkey). Eyes point, the
 trigger commits.
 
 Live keys in the preview window:
-    1  -> record current pose as the LAPTOP monitor
-    2  -> record current pose as the TOP monitor
-    3  -> record current pose as the RIGHT monitor
+    1  -> ADD a LAPTOP-monitor pose sample (press again from other postures)
+    2  -> ADD a TOP-monitor pose sample
+    3  -> ADD a RIGHT-monitor pose sample
+    u  -> undo the last pose sample you added
     t  -> record TOP window of the current monitor (look at it first)
     b  -> record BOTTOM window of the current monitor (look at it first)
     x  -> clear the current monitor's top/bottom (eye) calibration
@@ -55,6 +56,11 @@ Live keys in the preview window:
     [  -> stickier (harder to switch zones)
     ]  -> looser (easier to switch zones)
     q / ESC -> quit
+
+Each 1/2/3 press ADDS a sample rather than overwriting, so you can record a
+monitor from several head/body postures (leaning back, sitting upright, etc.)
+and a frame is matched to the NEAREST sample of each zone -- robust to the way
+you actually shift around.
 """
 
 import argparse
@@ -109,7 +115,8 @@ CALIB_FRAMES = 12
 
 # Bump when the head/eye signal definition changes so stale calibration (stored
 # in the old units) is discarded instead of silently mixed with the new signal.
-CONFIG_VERSION = 2
+# v3: "points" is now {zone: [[yaw,pitch], ...]} (multiple samples per monitor).
+CONFIG_VERSION = 3
 
 ZONE_NAMES = {0: "LAPTOP", 1: "TOP", 2: "RIGHT"}
 # Short labels for the calibration dots in the preview.
@@ -309,26 +316,42 @@ def sub_gaze_y(zone, pitch, vgaze, cfg):
     return float(min(1.0, max(0.0, t)))
 
 
+def _samples(zone_pts):
+    """A zone's stored value as a list of [yaw, pitch] samples.
+
+    Tolerates the old single-point shape [yaw, pitch] (auto-cleared on version
+    bump, but cheap to stay robust) by wrapping it in a one-element list.
+    """
+    if zone_pts and isinstance(zone_pts[0], (list, tuple)):
+        return zone_pts
+    return [zone_pts]
+
+
 def _spans(points):
-    ys = [p[0] for p in points.values()]
-    ps = [p[1] for p in points.values()]
+    flat = [s for zp in points.values() for s in _samples(zp)]
+    ys = [s[0] for s in flat]
+    ps = [s[1] for s in flat]
     yaw_span = max(max(ys) - min(ys), SPAN_FLOOR)
     pitch_span = max(max(ps) - min(ps), SPAN_FLOOR)
     return yaw_span, pitch_span
 
 
 def distances(yaw, pitch, points):
-    """Normalized distance from (yaw, pitch) to each calibrated zone point.
+    """Normalized distance from (yaw, pitch) to each calibrated zone.
 
     Each axis is scaled by how far apart the calibrated monitors are on that
     axis, so the axis that actually separates your monitors carries the weight.
+    A zone can hold several pose samples; its distance is the NEAREST sample, so
+    recording a monitor from multiple postures only ever helps.
     """
     yaw_span, pitch_span = _spans(points)
     out = {}
-    for k, (py, pp) in points.items():
-        dy = (yaw - py) / yaw_span
-        dp = (pitch - pp) / pitch_span
-        out[int(k)] = math.hypot(dy, dp)
+    for k, zp in points.items():
+        best = min(
+            math.hypot((yaw - py) / yaw_span, (pitch - pp) / pitch_span)
+            for (py, pp) in _samples(zp)
+        )
+        out[int(k)] = best
     return out
 
 
@@ -394,13 +417,20 @@ def draw_overlay(frame, yaw, pitch, cfg, zone, vgaze=None, gaze_y=None):
     cv2.line(frame, (bx + bw // 2, by), (bx + bw // 2, by + bh), (60, 60, 60), 1)
     cv2.line(frame, (bx, by + bh // 2), (bx + bw, by + bh // 2), (60, 60, 60), 1)
 
-    # calibrated points
-    for k, (py, pp) in points.items():
-        cpx, cpy = _to_px(py, pp, box)
+    # calibrated points (one ring per recorded sample; label the centroid)
+    total_samples = 0
+    for k, zp in points.items():
+        samples = _samples(zp)
+        total_samples += len(samples)
         hit = (int(k) == zone)
         col = (60, 220, 255) if hit else (160, 160, 160)
-        cv2.circle(frame, (cpx, cpy), 7, col, 2)
-        cv2.putText(frame, ZONE_TAGS[int(k)], (cpx - 6, cpy - 10),
+        for (py, pp) in samples:
+            cpx, cpy = _to_px(py, pp, box)
+            cv2.circle(frame, (cpx, cpy), 5, col, 1)
+        mx = sum(s[0] for s in samples) / len(samples)
+        my = sum(s[1] for s in samples) / len(samples)
+        lpx0, lpy0 = _to_px(mx, my, box)
+        cv2.putText(frame, ZONE_TAGS[int(k)], (lpx0 - 6, lpy0 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
     # live pose dot
@@ -413,9 +443,10 @@ def draw_overlay(frame, yaw, pitch, cfg, zone, vgaze=None, gaze_y=None):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (60, 220, 255), 2)
     else:
         cv2.putText(frame,
-                    "1/2/3=monitors  t/b=top/bottom window  x=clear eye  r=reset  [ ]=sticky  q=quit",
-                    (20, h - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-    cv2.putText(frame, f"calibrated: {len(points)}/3   margin={cfg['margin']:.2f}",
+                    "1/2/3=add sample  u=undo  t/b=top/bottom window  x=clear eye  r=reset  [ ]=sticky  q=quit",
+                    (20, h - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1)
+    cv2.putText(frame,
+                f"zones: {len(points)}/3   samples: {total_samples}   margin={cfg['margin']:.2f}",
                 (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 2)
 
 
@@ -456,6 +487,7 @@ def main():
     f_hy = OneEuro(HEAD_MIN_CUTOFF, HEAD_BETA)
     f_vg = OneEuro(EYE_MIN_CUTOFF, EYE_BETA)
     recent = deque(maxlen=CALIB_FRAMES)  # recent (yaw, pitch, vgaze) for calibration
+    last_added = None  # zone of the most recently added pose sample (for undo)
     min_dt = 1.0 / args.fps if args.fps > 0 else 0.0
     print(f"gaze-focus running. writing -> {STATE_PATH}")
     if len(cfg["points"]) < 3:
@@ -514,12 +546,26 @@ def main():
                     if head_pts:
                         ax = sum(p[0] for p in head_pts) / len(head_pts)
                         ay = sum(p[1] for p in head_pts) / len(head_pts)
-                        cfg["points"][str(z)] = [round(ax, 4), round(ay, 4)]
+                        samples = cfg["points"].setdefault(str(z), [])
+                        samples.append([round(ax, 4), round(ay, 4)])
+                        last_added = z
                         save_config(cfg)
-                        print(f"recorded {ZONE_NAMES[z]} (avg of {len(head_pts)} "
-                              f"frames): yaw={ax:.3f} pitch={ay:.3f}")
+                        print(f"added {ZONE_NAMES[z]} sample #{len(samples)} "
+                              f"(avg of {len(head_pts)} frames): "
+                              f"yaw={ax:.3f} pitch={ay:.3f}")
                     else:
                         print("no face detected yet -- look at the camera first.")
+                elif key == ord("u"):
+                    if last_added is not None and cfg["points"].get(str(last_added)):
+                        dropped = cfg["points"][str(last_added)].pop()
+                        if not cfg["points"][str(last_added)]:
+                            cfg["points"].pop(str(last_added))
+                        save_config(cfg)
+                        print(f"undid last {ZONE_NAMES[last_added]} sample "
+                              f"(yaw={dropped[0]:.3f} pitch={dropped[1]:.3f}).")
+                        last_added = None
+                    else:
+                        print("nothing to undo.")
                 elif key in (ord("t"), ord("b")):
                     eye_pts = [(b, c) for (_, b, c) in recent if c is not None]
                     if zone in (0, 1, 2) and eye_pts:

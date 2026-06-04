@@ -39,7 +39,7 @@ First run macOS will ask for **Camera** access for your terminal — allow it.
 On first launch it also downloads a small (~3.8 MB) face-landmark model to
 `~/.gaze/face_landmarker.task`, so you'll need internet that one time.
 
-A preview window opens. **Calibrate once** — look at each monitor the way you
+A preview window opens. **Calibrate** — look at each monitor the way you
 naturally would and press its number:
 
 1. Look at your **laptop** → press **`1`**
@@ -48,12 +48,18 @@ naturally would and press its number:
 
 After all three are set, the **ZONE** label tracks whichever monitor your head
 is closest to. The green dot in the box is your live head pose; the labeled
-circles (L/T/R) are your calibrated points. Re-press a number anytime to
-re-record it; `r` clears everything.
+circles (L/T/R) are your calibrated samples.
 
+- **Record multiple poses per monitor.** Each press of `1`/`2`/`3` *adds* a
+  sample — it no longer overwrites. So look at a monitor while leaning back and
+  press `2`, then sit upright and press `2` again, then maybe slouch and press
+  it once more. A live frame is matched to the **nearest** sample of each zone,
+  so spreading a few postures per screen makes the pick far more robust to how
+  you actually shift around. The footer shows `samples: N`. Pressed it by
+  mistake? `u` undoes the last sample you added; `r` clears everything.
 - Switching too eagerly or not eagerly enough? `[` makes it stickier (harder to
   leave the current zone), `]` makes it looser.
-- Calibration persists to `~/.gaze/config.json`, so you only do this once.
+- Calibration persists to `~/.gaze/config.json`, so it sticks across restarts.
 
 ### Optional: calibrate a screen's top/bottom split (eye gaze)
 
