@@ -18,18 +18,23 @@ Because laptop and top are both straight ahead, head turn alone can't tell them
 apart -- we need the up/down tilt too.
 
 How it decides: you calibrate once by looking at each monitor and pressing its
-number key (1/2/3). That records the head pose (yaw, pitch) for that monitor.
-From then on, each frame is classified to whichever calibrated point it's
-closest to. No hand-tuned thresholds, no assumptions about geometry -- it just
-learns where you point your head for each screen. A stickiness margin keeps the
-zone stable so it doesn't flicker at the boundaries.
+number key (1/2/3). That records the head pose for that monitor; each frame is
+then classified to whichever calibrated point it's closest to. No hand-tuned
+thresholds, no assumptions about geometry. The head pose comes from the model's
+real 3D facial-orientation matrix (not 2D landmark ratios) and is run through a
+One-Euro filter, so it's smooth when you hold still but snappy when you turn.
+Calibration averages ~0.4 s of frames, so hold your gaze on the target for a
+beat before pressing the key. A stickiness margin keeps the zone stable so it
+doesn't flicker at the boundaries.
 
 EYE GAZE (sub-window selection):
 Head pose can pick the monitor, but it can't tell apart two windows split on
 the SAME screen (e.g. a top + bottom split on the vertical monitor) -- you move
 your eyes for that, not your head. So we also read vertical EYE gaze from the
-iris landmarks. Calibrate a screen's split by looking at the top window (press
-'t') and the bottom window (press 'b'); from then on we emit a continuous
+iris landmarks (measured against the rigid eye corners, so it tracks eyeball
+rotation rather than eyelid movement). Calibrate a screen's split by looking at
+the top window (press 't') and the bottom window (press 'b') -- hold your gaze
+for a beat so it averages cleanly; from then on we emit a continuous
 "gaze_y" in [0,1] (0 = top, 1 = bottom) whenever that screen is the active zone.
 Hammerspoon uses gaze_y to focus the exact window at that height. This works for
 any vertical split (2, 3, ... windows), not just two.
@@ -58,6 +63,7 @@ import math
 import os
 import time
 import urllib.request
+from collections import deque
 
 import cv2
 import numpy as np
@@ -89,8 +95,21 @@ CHIN = 152
 R_EYE_TOP, R_EYE_BOT, R_EYE_IN, R_EYE_OUT, R_IRIS = 159, 145, 133, 33, 473
 L_EYE_TOP, L_EYE_BOT, L_EYE_IN, L_EYE_OUT, L_IRIS = 386, 374, 362, 263, 468
 BLINK_MIN = 0.12       # lid-open / eye-width below this = blink, hold last value
-VGAZE_ALPHA = 0.35     # EMA smoothing for the (noisy) raw eye-gaze signal
 GY_ALPHA = 0.45        # EMA smoothing for the derived gaze_y
+
+# One-Euro filter params (smooth when still, snappy when you move). Tuned for
+# ~30 fps. Head direction tolerates a higher cutoff; the noisier eye signal
+# gets more smoothing.
+HEAD_MIN_CUTOFF, HEAD_BETA = 1.2, 0.35
+EYE_MIN_CUTOFF, EYE_BETA = 0.8, 0.25
+
+# Calibration averages this many recent frames, so one noisy frame (or a
+# mid-saccade sample) can't poison an anchor. ~0.4 s at 30 fps.
+CALIB_FRAMES = 12
+
+# Bump when the head/eye signal definition changes so stale calibration (stored
+# in the old units) is discarded instead of silently mixed with the new signal.
+CONFIG_VERSION = 2
 
 ZONE_NAMES = {0: "LAPTOP", 1: "TOP", 2: "RIGHT"}
 # Short labels for the calibration dots in the preview.
@@ -98,8 +117,47 @@ ZONE_TAGS = {0: "L", 1: "T", 2: "R"}
 SPAN_FLOOR = 0.05  # avoid divide-by-zero when monitors share an axis
 
 
+class OneEuro:
+    """One-Euro filter: smooths a noisy scalar with low latency.
+
+    Adapts to motion -- heavy smoothing when the signal is still (kills jitter),
+    light smoothing when it's moving fast (stays responsive). Far better than a
+    fixed-alpha EMA for an interactive pointing signal.
+    """
+
+    def __init__(self, min_cutoff=1.0, beta=0.3, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev = None
+        self.dx_prev = 0.0
+        self.t_prev = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x, t):
+        if self.x_prev is None:
+            self.x_prev, self.t_prev = x, t
+            return x
+        dt = t - self.t_prev
+        if dt <= 0:
+            dt = 1e-3
+        self.t_prev = t
+        dx = (x - self.x_prev) / dt
+        a_d = self._alpha(self.d_cutoff, dt)
+        dx_hat = a_d * dx + (1.0 - a_d) * self.dx_prev
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        a = self._alpha(cutoff, dt)
+        x_hat = a * x + (1.0 - a) * self.x_prev
+        self.x_prev, self.dx_prev = x_hat, dx_hat
+        return x_hat
+
+
 def load_config():
-    defaults = {"points": {}, "sub": {}, "margin": 0.18}
+    defaults = {"points": {}, "sub": {}, "margin": 0.18, "version": None}
     try:
         with open(CONFIG_PATH) as f:
             defaults.update(json.load(f))
@@ -148,8 +206,32 @@ def ensure_model():
     return MODEL_PATH
 
 
+def head_dir_from_matrix(matrix):
+    """Head forward direction (hx, hy) from the model's 3D facial-transform matrix.
+
+    This is the model's real estimate of head orientation in 3D, so it's far more
+    stable than 2D landmark ratios and robust to where you sit. We rotate the
+    face's forward axis into camera space and use its x (left/right turn) and y
+    (up/down tilt) components as the signal. Exact sign/scale don't matter --
+    calibration is nearest-neighbor, so it only needs to be consistent.
+    Returns None if the matrix is missing or malformed (caller falls back).
+    """
+    m = np.asarray(matrix, dtype=float)
+    if m.size == 16:
+        m = m.reshape(4, 4)
+    if m.shape != (4, 4):
+        return None
+    fwd = m[:3, :3] @ np.array([0.0, 0.0, -1.0])
+    n = np.linalg.norm(fwd)
+    if n < 1e-9:
+        return None
+    fwd = fwd / n
+    return float(fwd[0]), float(fwd[1])
+
+
 def head_signals(landmarks):
-    """Return (yaw, pitch).
+    """Fallback (yaw, pitch) from 2D landmarks, used only if the 3D matrix is
+    unavailable in this MediaPipe build.
 
     yaw:   nose offset between the cheeks, ~[-1, 1]. + = turned toward one side.
     pitch: nose height between the eye line and the chin, ~[0, 1].
@@ -169,10 +251,12 @@ def head_signals(landmarks):
 
 
 def eye_vgaze(landmarks):
-    """Vertical eye-gaze ratio, ~[0, 1]: 0 = looking up, 1 = looking down.
+    """Vertical eye-gaze signal: more positive = looking further down.
 
-    For each eye, measures where the iris center sits between the upper and
-    lower lids, normalized by how open the eye is, then averages both eyes.
+    For each eye, measures the iris height relative to the eye-corner line
+    (which is rigid and moves with the head, not the lid), scaled by eye width,
+    then averages both eyes. This is more faithful to actual eyeball rotation --
+    and far less coupled to blink/lid movement -- than a lid-relative measure.
     Returns None during a blink/squint (lids too close) so the caller can hold
     the last good value instead of jumping. Also None if the model build lacks
     iris landmarks, which disables eye gaze without breaking head pose.
@@ -181,13 +265,12 @@ def eye_vgaze(landmarks):
         return None
 
     def one(top_i, bot_i, in_i, out_i, iris_i):
-        top = landmarks[top_i].y
-        bot = landmarks[bot_i].y
-        open_h = bot - top
+        open_h = landmarks[bot_i].y - landmarks[top_i].y
         width = abs(landmarks[out_i].x - landmarks[in_i].x)
         if width < 1e-6 or (open_h / width) < BLINK_MIN:
-            return None
-        return (landmarks[iris_i].y - top) / open_h
+            return None  # eye closed / squinting -> unreliable
+        corner_mid_y = (landmarks[in_i].y + landmarks[out_i].y) / 2.0
+        return (landmarks[iris_i].y - corner_mid_y) / width
 
     vals = [
         v for v in (
@@ -263,12 +346,12 @@ def classify(yaw, pitch, cfg, current):
     return nearest
 
 
-def _to_px(yaw, pitch, box):
+def _to_px(hx, hy, box):
     bx, by, bw, bh = box
-    yn = np.clip((yaw + 1.0) / 2.0, 0.0, 1.0)        # -1..1 -> 0..1
-    pn = np.clip((pitch - 0.2) / 0.6, 0.0, 1.0)      # 0.2..0.8 -> 0..1
-    px = int(bx + yn * bw)
-    py = int(by + (1.0 - pn) * bh)                   # look up -> toward top
+    xn = np.clip((hx + 0.7) / 1.4, 0.0, 1.0)         # ~[-0.7, 0.7] -> 0..1
+    yn = np.clip((hy + 0.7) / 1.4, 0.0, 1.0)         # look up (neg) -> toward top
+    px = int(bx + xn * bw)
+    py = int(by + yn * bh)
     return px, py
 
 
@@ -344,6 +427,12 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config()
+    if cfg.get("version") != CONFIG_VERSION:
+        if cfg.get("points") or cfg.get("sub"):
+            print("Signal model upgraded -> old calibration cleared. "
+                  "Recalibrate: press 1/2/3 for monitors, then t/b per split.")
+        cfg["points"], cfg["sub"], cfg["version"] = {}, {}, CONFIG_VERSION
+        save_config(cfg)
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -354,14 +443,19 @@ def main():
         base_options=mp_python.BaseOptions(model_asset_path=model_path),
         running_mode=mp_vision.RunningMode.VIDEO,
         num_faces=1,
+        output_facial_transformation_matrixes=True,
     )
     landmarker = mp_vision.FaceLandmarker.create_from_options(options)
     ts_ms = 0
 
     zone = -1
-    last_yaw, last_pitch = 0.0, 0.5
+    last_yaw, last_pitch = 0.0, 0.0
     vgaze_s = None   # smoothed raw eye-gaze
     gaze_y_s = None  # smoothed within-monitor vertical position
+    f_hx = OneEuro(HEAD_MIN_CUTOFF, HEAD_BETA)
+    f_hy = OneEuro(HEAD_MIN_CUTOFF, HEAD_BETA)
+    f_vg = OneEuro(EYE_MIN_CUTOFF, EYE_BETA)
+    recent = deque(maxlen=CALIB_FRAMES)  # recent (yaw, pitch, vgaze) for calibration
     min_dt = 1.0 / args.fps if args.fps > 0 else 0.0
     print(f"gaze-focus running. writing -> {STATE_PATH}")
     if len(cfg["points"]) < 3:
@@ -385,12 +479,19 @@ def main():
             yaw, pitch = last_yaw, last_pitch
             if result.face_landmarks:
                 lm = result.face_landmarks[0]
-                yaw, pitch = head_signals(lm)
+                hd = None
+                if result.facial_transformation_matrixes:
+                    hd = head_dir_from_matrix(
+                        result.facial_transformation_matrixes[0])
+                if hd is None:
+                    hd = head_signals(lm)  # 2D fallback if no 3D matrix
+                yaw = f_hx(hd[0], t0)
+                pitch = f_hy(hd[1], t0)
                 last_yaw, last_pitch = yaw, pitch
                 raw_v = eye_vgaze(lm)
                 if raw_v is not None:
-                    vgaze_s = raw_v if vgaze_s is None else (
-                        VGAZE_ALPHA * raw_v + (1.0 - VGAZE_ALPHA) * vgaze_s)
+                    vgaze_s = f_vg(raw_v, t0)
+                recent.append((yaw, pitch, vgaze_s))
 
             zone = classify(yaw, pitch, cfg, zone)
             gy = sub_gaze_y(zone, pitch, vgaze_s, cfg)
@@ -409,18 +510,28 @@ def main():
                     break
                 elif key in (ord("1"), ord("2"), ord("3")):
                     z = key - ord("1")  # '1'->0, '2'->1, '3'->2
-                    cfg["points"][str(z)] = [round(last_yaw, 4), round(last_pitch, 4)]
-                    save_config(cfg)
-                    print(f"recorded {ZONE_NAMES[z]}: yaw={last_yaw:.3f} pitch={last_pitch:.3f}")
-                elif key in (ord("t"), ord("b")):
-                    if zone in (0, 1, 2) and vgaze_s is not None:
-                        slot = "top" if key == ord("t") else "bottom"
-                        cfg.setdefault("sub", {}).setdefault(str(zone), {})[slot] = [
-                            round(last_pitch, 4), round(vgaze_s, 4)]
+                    head_pts = [(a, b) for (a, b, _) in recent]
+                    if head_pts:
+                        ax = sum(p[0] for p in head_pts) / len(head_pts)
+                        ay = sum(p[1] for p in head_pts) / len(head_pts)
+                        cfg["points"][str(z)] = [round(ax, 4), round(ay, 4)]
                         save_config(cfg)
-                        print(f"recorded {slot.upper()} window of {ZONE_NAMES[zone]}: "
-                              f"pitch={last_pitch:.3f} vgaze={vgaze_s:.3f}")
-                    elif vgaze_s is None:
+                        print(f"recorded {ZONE_NAMES[z]} (avg of {len(head_pts)} "
+                              f"frames): yaw={ax:.3f} pitch={ay:.3f}")
+                    else:
+                        print("no face detected yet -- look at the camera first.")
+                elif key in (ord("t"), ord("b")):
+                    eye_pts = [(b, c) for (_, b, c) in recent if c is not None]
+                    if zone in (0, 1, 2) and eye_pts:
+                        slot = "top" if key == ord("t") else "bottom"
+                        ap = sum(p[0] for p in eye_pts) / len(eye_pts)
+                        av = sum(p[1] for p in eye_pts) / len(eye_pts)
+                        cfg.setdefault("sub", {}).setdefault(str(zone), {})[slot] = [
+                            round(ap, 4), round(av, 4)]
+                        save_config(cfg)
+                        print(f"recorded {slot.upper()} window of {ZONE_NAMES[zone]} "
+                              f"(avg of {len(eye_pts)}): pitch={ap:.3f} vgaze={av:.3f}")
+                    elif not eye_pts:
                         print("can't record: eyes not detected (blink/lighting).")
                     else:
                         print("look at a calibrated monitor first (zone unknown).")

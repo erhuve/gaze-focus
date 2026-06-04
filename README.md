@@ -123,19 +123,33 @@ to see the names).
 
 ## Notes & tuning
 
+> **Recalibrate after upgrading.** The head/eye signals were reworked for
+> accuracy (see below), so old calibration is auto-cleared on first run. Just
+> press `1`/`2`/`3` for your monitors again, then `t`/`b` for any split. Hold
+> your gaze on each target for a beat — calibration now averages ~0.4 s of
+> frames instead of a single instant, so a steady look gives a cleaner anchor.
+
 - **Head pose for screens, eye gaze for windows:** a single webcam can't reliably
   tell *which of three screens* your pupils point at, but it reads head turn +
   tilt cleanly, and on a spread-out desk you naturally move your head toward each
   screen. *Within* one screen, though, you move your eyes, not your head — so the
   top/bottom-window pick uses iris position instead. Right tool per scale.
-- **Two axes (screen pick):** left/right turn (yaw) separates the right monitor;
-  up/down tilt (pitch) separates the laptop from the monitor above it. Each frame
-  is matched to the *nearest* calibrated head pose — no hand-tuned thresholds, so
-  it adapts to wherever you actually point.
+- **3D head orientation:** the screen pick uses the model's real 3D head-rotation
+  matrix (the direction your face points), not 2D nose-between-cheeks ratios — much
+  more stable, and it sharpens the laptop↔top (up/down) distinction in particular.
+- **One-Euro filtering:** every signal is smoothed adaptively — heavy smoothing
+  when you're still (no jitter), light when you're turning (no lag). Tune in
+  `head_pose_service.py`: raise `HEAD_BETA`/`EYE_BETA` for more responsiveness,
+  raise the `*_MIN_CUTOFF` values for more smoothing.
+- **Two axes (screen pick):** left/right turn separates the right monitor; up/down
+  tilt separates the laptop from the monitor above it. Each frame is matched to the
+  *nearest* calibrated head pose — no hand-tuned thresholds, so it adapts to
+  wherever you actually point.
 - **`gaze_y` (window pick):** derived by projecting your current (head-pitch,
   eye-vertical) onto the line between your calibrated top and bottom samples, so
-  it works whether you move your eyes, tip your head, or both. Smoothed and
-  blink-guarded; Hammerspoon maps it to the window at that height on the screen.
+  it works whether you move your eyes, tip your head, or both. The eye signal is
+  measured against the rigid eye corners (tracks the eyeball, not the eyelid),
+  smoothed and blink-guarded; Hammerspoon maps it to the window at that height.
 - **Hysteresis** (the stickiness margin) keeps the zone stable near boundaries,
   so it's settled by the time you press the trigger. Tune with `[` / `]`.
 - To swap the trigger to a real **foot pedal** later, map the pedal to whatever
