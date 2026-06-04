@@ -30,14 +30,16 @@ doesn't flicker at the boundaries.
 EYE GAZE (sub-window selection):
 Head pose can pick the monitor, but it can't tell apart two windows split on
 the SAME screen (e.g. a top + bottom split on the vertical monitor) -- you move
-your eyes for that, not your head. So we also read vertical EYE gaze from the
-iris landmarks (measured against the rigid eye corners, so it tracks eyeball
-rotation rather than eyelid movement). Calibrate a screen's split by looking at
-the top window (press 't') and the bottom window (press 'b') -- hold your gaze
-for a beat so it averages cleanly; from then on we emit a continuous
-"gaze_y" in [0,1] (0 = top, 1 = bottom) whenever that screen is the active zone.
-Hammerspoon uses gaze_y to focus the exact window at that height. This works for
-any vertical split (2, 3, ... windows), not just two.
+your eyes for that, not your head. So we also estimate vertical EYE gaze with a
+small appearance-based neural net: an ONNX gaze model (trained on Gaze360) run
+on a crop of your face. Unlike geometric iris-ratio tricks it stays accurate
+even when your head is turned, which is exactly when those tricks fall apart.
+Calibrate a screen's split by looking at the top window (press 't') and the
+bottom window (press 'b') -- hold your gaze for a beat so it averages cleanly;
+from then on we emit a continuous "gaze_y" in [0,1] (0 = top, 1 = bottom)
+whenever that screen is the active zone. Hammerspoon uses gaze_y to focus the
+exact window at that height. This works for any vertical split (2, 3, ...
+windows), not just two.
 
 It NEVER changes window focus. It just keeps the current zone (and, when
 calibrated, gaze_y) live. The commit (actually switching focus) is done by
@@ -73,6 +75,7 @@ from collections import deque
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -95,13 +98,27 @@ RIGHT_EYE_OUTER = 33
 LEFT_EYE_OUTER = 263
 CHIN = 152
 
-# Iris + eyelid landmarks for vertical eye gaze. The 478-landmark model includes
-# iris points (468-477) by default, so no extra options are needed.
-# Per eye we use upper/lower lid, inner/outer corner, and the iris center.
-R_EYE_TOP, R_EYE_BOT, R_EYE_IN, R_EYE_OUT, R_IRIS = 159, 145, 133, 33, 473
-L_EYE_TOP, L_EYE_BOT, L_EYE_IN, L_EYE_OUT, L_IRIS = 386, 374, 362, 263, 468
+# Eyelid + corner landmarks, used ONLY to detect blinks/squints so we can hold
+# the last good gaze read instead of trusting a half-shut eye. The vertical-gaze
+# signal itself comes from the ONNX model below, not from these points.
+R_EYE_TOP, R_EYE_BOT, R_EYE_IN, R_EYE_OUT = 159, 145, 133, 33
+L_EYE_TOP, L_EYE_BOT, L_EYE_IN, L_EYE_OUT = 386, 374, 362, 263
 BLINK_MIN = 0.12       # lid-open / eye-width below this = blink, hold last value
 GY_ALPHA = 0.45        # EMA smoothing for the derived gaze_y
+
+# Appearance-based vertical eye-gaze model (ONNX, MobileGaze/L2CS family). We run
+# it on a face crop and use its pitch (up/down) output as the "vgaze" signal.
+# mobileone_s0 is the fast default (~22 ms/frame CPU, faster with CoreML on a
+# Mac); resnet34 is the most accurate but heavier. Weights are pulled on first
+# run from the yakhyo/gaze-estimation release.
+GAZE_MODEL_DEFAULT = "mobileone_s0"
+GAZE_MODELS = ("mobileone_s0", "resnet18", "resnet34")
+GAZE_MODEL_URL = (
+    "https://github.com/yakhyo/gaze-estimation/releases/download/weights/"
+    "{name}_gaze.onnx"
+)
+FACE_CROP_MARGIN = 0.15  # expand the landmark bbox before cropping for the model
+MIN_CROP_PX = 24         # skip the gaze read if the face crop is smaller than this
 
 # One-Euro filter params (smooth when still, snappy when you move). Tuned for
 # ~30 fps. Head direction tolerates a higher cutoff; the noisier eye signal
@@ -115,8 +132,11 @@ CALIB_FRAMES = 12
 
 # Bump when the head/eye signal definition changes so stale calibration (stored
 # in the old units) is discarded instead of silently mixed with the new signal.
-# v3: "points" is now {zone: [[yaw,pitch], ...]} (multiple samples per monitor).
-CONFIG_VERSION = 3
+# v3: "points" is {zone: [[yaw,pitch], ...]} (multiple samples per monitor).
+# v4: eye gaze switched from an iris-corner ratio to the ONNX gaze model, so the
+#     "sub" (top/bottom) calibration changes units -- but "points" (head pose) is
+#     unchanged, so the v3->v4 upgrade keeps monitors and clears only the splits.
+CONFIG_VERSION = 4
 
 ZONE_NAMES = {0: "LAPTOP", 1: "TOP", 2: "RIGHT"}
 # Short labels for the calibration dots in the preview.
@@ -163,6 +183,62 @@ class OneEuro:
         return x_hat
 
 
+class GazeEstimationONNX:
+    """Appearance-based gaze estimator (ONNX). Returns (yaw, pitch) in radians.
+
+    Wraps a MobileGaze/L2CS-style model: the network outputs binned logits that
+    we soft-decode (softmax expectation) into continuous angles. We only consume
+    pitch (vertical) for the window split, but yaw is decoded too for parity with
+    the upstream model. The input size and IO names are read from the model, so
+    swapping backbones (mobileone_s0 / resnet18 / resnet34) just works.
+    """
+
+    def __init__(self, model_path, providers):
+        self.session = ort.InferenceSession(model_path, providers=providers)
+        self._bins, self._binwidth, self._angle_offset = 90, 4, 180
+        self.idx = np.arange(self._bins, dtype=np.float32)
+        inp = self.session.get_inputs()[0]
+        self.input_name = inp.name
+        hw = inp.shape[2:]  # NCHW -> [H, W]
+        try:
+            self.input_size = (int(hw[1]), int(hw[0]))  # cv2 wants (w, h)
+        except (TypeError, ValueError, IndexError):
+            self.input_size = (448, 448)
+        self.out_names = [o.name for o in self.session.get_outputs()]
+        self.mean = np.array([0.485, 0.456, 0.406], np.float32)
+        self.std = np.array([0.229, 0.224, 0.225], np.float32)
+
+    def _preprocess(self, img_bgr):
+        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, self.input_size).astype(np.float32) / 255.0
+        img = (img - self.mean) / self.std
+        img = np.transpose(img, (2, 0, 1))
+        return np.expand_dims(img, 0).astype(np.float32)
+
+    @staticmethod
+    def _softmax(x):
+        e = np.exp(x - np.max(x, axis=1, keepdims=True))
+        return e / e.sum(axis=1, keepdims=True)
+
+    def estimate(self, face_bgr):
+        out = self.session.run(
+            self.out_names, {self.input_name: self._preprocess(face_bgr)})
+        yaw = np.sum(self._softmax(out[0]) * self.idx, axis=1) \
+            * self._binwidth - self._angle_offset
+        pitch = np.sum(self._softmax(out[1]) * self.idx, axis=1) \
+            * self._binwidth - self._angle_offset
+        return float(np.radians(yaw[0])), float(np.radians(pitch[0]))
+
+
+def gaze_providers():
+    """ONNX Runtime providers, best-available first: CoreML (Mac) / CUDA / CPU."""
+    order = ["CoreMLExecutionProvider", "CUDAExecutionProvider",
+             "CPUExecutionProvider"]
+    avail = set(ort.get_available_providers())
+    sel = [p for p in order if p in avail]
+    return sel or ["CPUExecutionProvider"]
+
+
 def load_config():
     defaults = {"points": {}, "sub": {}, "margin": 0.18, "version": None}
     try:
@@ -179,6 +255,32 @@ def save_config(cfg):
     with open(tmp, "w") as f:
         json.dump(cfg, f, indent=2)
     os.replace(tmp, CONFIG_PATH)
+
+
+def reconcile_version(cfg):
+    """Migrate calibration to the current CONFIG_VERSION. Returns True if changed.
+
+    v3 -> v4 only changed the eye signal (iris ratio -> ONNX gaze), so we keep
+    the head-pose "points" and clear just the "sub" splits. Any other (older or
+    unknown) version is cleared wholesale, since its units can't be trusted.
+    """
+    v = cfg.get("version")
+    if v == CONFIG_VERSION:
+        return False
+    if v == 3:
+        had_sub = bool(cfg.get("sub"))
+        cfg["sub"] = {}
+        cfg["version"] = CONFIG_VERSION
+        if had_sub:
+            print("Eye gaze upgraded to the ONNX model -> old top/bottom "
+                  "calibration cleared (monitor calibration kept). "
+                  "Recalibrate splits with t/b.")
+        return True
+    if cfg.get("points") or cfg.get("sub"):
+        print("Calibration format upgraded -> old calibration cleared. "
+              "Recalibrate: 1/2/3 for monitors, then t/b per split.")
+    cfg["points"], cfg["sub"], cfg["version"] = {}, {}, CONFIG_VERSION
+    return True
 
 
 def write_state(zone, yaw, pitch, vgaze, gaze_y, has_sub):
@@ -211,6 +313,21 @@ def ensure_model():
     os.replace(tmp, MODEL_PATH)
     print("model ready.")
     return MODEL_PATH
+
+
+def ensure_gaze_model(name):
+    """Download the chosen ONNX gaze model on first run."""
+    path = os.path.join(GAZE_DIR, f"{name}_gaze.onnx")
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    os.makedirs(GAZE_DIR, exist_ok=True)
+    url = GAZE_MODEL_URL.format(name=name)
+    print(f"downloading gaze model '{name}' -> {path} ...")
+    tmp = path + ".tmp"
+    urllib.request.urlretrieve(url, tmp)
+    os.replace(tmp, path)
+    print("gaze model ready.")
+    return path
 
 
 def head_dir_from_matrix(matrix):
@@ -257,37 +374,51 @@ def head_signals(landmarks):
     return yaw, pitch
 
 
-def eye_vgaze(landmarks):
-    """Vertical eye-gaze signal: more positive = looking further down.
+def bbox_from_landmarks(landmarks, w, h, margin=FACE_CROP_MARGIN):
+    """Pixel face bounding box from the normalized landmarks, padded by `margin`.
 
-    For each eye, measures the iris height relative to the eye-corner line
-    (which is rigid and moves with the head, not the lid), scaled by eye width,
-    then averages both eyes. This is more faithful to actual eyeball rotation --
-    and far less coupled to blink/lid movement -- than a lid-relative measure.
-    Returns None during a blink/squint (lids too close) so the caller can hold
-    the last good value instead of jumping. Also None if the model build lacks
-    iris landmarks, which disables eye gaze without breaking head pose.
+    Gives the ONNX gaze model a head crop without pulling in a separate face
+    detector -- the landmarks already bound the face tightly, and the margin adds
+    a little context (forehead/jaw) the way the model's training crops did.
     """
-    if len(landmarks) <= max(L_IRIS, R_IRIS):
-        return None
+    xs = [p.x for p in landmarks]
+    ys = [p.y for p in landmarks]
+    x0, x1 = min(xs) * w, max(xs) * w
+    y0, y1 = min(ys) * h, max(ys) * h
+    bw, bh = x1 - x0, y1 - y0
+    x0 -= bw * margin
+    x1 += bw * margin
+    y0 -= bh * margin
+    y1 += bh * margin
+    x0 = int(max(0, x0))
+    y0 = int(max(0, y0))
+    x1 = int(min(w, x1))
+    y1 = int(min(h, y1))
+    return x0, y0, x1, y1
 
-    def one(top_i, bot_i, in_i, out_i, iris_i):
-        open_h = landmarks[bot_i].y - landmarks[top_i].y
+
+def is_blinking(landmarks):
+    """True if the eyes are too closed for a trustworthy gaze read.
+
+    Uses lid-open height over eye width, averaged across both eyes. During a
+    blink/squint we hold the last good gaze value instead of feeding the model a
+    half-shut eye. Returns False (assume open) if the lid landmarks are missing.
+    """
+    if len(landmarks) <= max(L_EYE_BOT, R_EYE_BOT, L_EYE_OUT, R_EYE_OUT):
+        return False
+
+    def ratio(top_i, bot_i, in_i, out_i):
         width = abs(landmarks[out_i].x - landmarks[in_i].x)
-        if width < 1e-6 or (open_h / width) < BLINK_MIN:
-            return None  # eye closed / squinting -> unreliable
-        corner_mid_y = (landmarks[in_i].y + landmarks[out_i].y) / 2.0
-        return (landmarks[iris_i].y - corner_mid_y) / width
+        if width < 1e-6:
+            return None
+        return (landmarks[bot_i].y - landmarks[top_i].y) / width
 
-    vals = [
-        v for v in (
-            one(R_EYE_TOP, R_EYE_BOT, R_EYE_IN, R_EYE_OUT, R_IRIS),
-            one(L_EYE_TOP, L_EYE_BOT, L_EYE_IN, L_EYE_OUT, L_IRIS),
-        ) if v is not None
-    ]
-    if not vals:
-        return None
-    return sum(vals) / len(vals)
+    rs = [r for r in (ratio(R_EYE_TOP, R_EYE_BOT, R_EYE_IN, R_EYE_OUT),
+                      ratio(L_EYE_TOP, L_EYE_BOT, L_EYE_IN, L_EYE_OUT))
+          if r is not None]
+    if not rs:
+        return False
+    return (sum(rs) / len(rs)) < BLINK_MIN
 
 
 def has_sub(zone, cfg):
@@ -455,14 +586,16 @@ def main():
     ap.add_argument("--camera", type=int, default=0, help="camera index (default 0)")
     ap.add_argument("--no-preview", action="store_true", help="run headless, no window")
     ap.add_argument("--fps", type=float, default=30.0, help="max processing fps")
+    ap.add_argument("--gaze-model", choices=GAZE_MODELS, default=GAZE_MODEL_DEFAULT,
+                    help="ONNX eye-gaze model: mobileone_s0 (fast, default), "
+                         "resnet18, or resnet34 (most accurate, heavier on CPU)")
+    ap.add_argument("--gaze-stride", type=int, default=1,
+                    help="run the gaze model every Nth frame (raise to save CPU; "
+                         "head pose still runs every frame)")
     args = ap.parse_args()
 
     cfg = load_config()
-    if cfg.get("version") != CONFIG_VERSION:
-        if cfg.get("points") or cfg.get("sub"):
-            print("Signal model upgraded -> old calibration cleared. "
-                  "Recalibrate: press 1/2/3 for monitors, then t/b per split.")
-        cfg["points"], cfg["sub"], cfg["version"] = {}, {}, CONFIG_VERSION
+    if reconcile_version(cfg):
         save_config(cfg)
 
     cap = cv2.VideoCapture(args.camera)
@@ -479,15 +612,23 @@ def main():
     landmarker = mp_vision.FaceLandmarker.create_from_options(options)
     ts_ms = 0
 
+    gaze_path = ensure_gaze_model(args.gaze_model)
+    providers = gaze_providers()
+    engine = GazeEstimationONNX(gaze_path, providers)
+    gaze_stride = max(1, args.gaze_stride)
+    print(f"gaze model: {args.gaze_model}  input={engine.input_size}  "
+          f"providers={providers}  stride={gaze_stride}")
+
     zone = -1
     last_yaw, last_pitch = 0.0, 0.0
-    vgaze_s = None   # smoothed raw eye-gaze
+    vgaze_s = None   # smoothed eye-gaze pitch (None until first good read)
     gaze_y_s = None  # smoothed within-monitor vertical position
     f_hx = OneEuro(HEAD_MIN_CUTOFF, HEAD_BETA)
     f_hy = OneEuro(HEAD_MIN_CUTOFF, HEAD_BETA)
     f_vg = OneEuro(EYE_MIN_CUTOFF, EYE_BETA)
     recent = deque(maxlen=CALIB_FRAMES)  # recent (yaw, pitch, vgaze) for calibration
     last_added = None  # zone of the most recently added pose sample (for undo)
+    frame_i = 0
     min_dt = 1.0 / args.fps if args.fps > 0 else 0.0
     print(f"gaze-focus running. writing -> {STATE_PATH}")
     if len(cfg["points"]) < 3:
@@ -503,6 +644,8 @@ def main():
                 time.sleep(0.05)
                 continue
             frame = cv2.flip(frame, 1)  # mirror so preview feels natural
+            h, w = frame.shape[:2]
+            frame_i += 1
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             ts_ms += 1
@@ -520,9 +663,16 @@ def main():
                 yaw = f_hx(hd[0], t0)
                 pitch = f_hy(hd[1], t0)
                 last_yaw, last_pitch = yaw, pitch
-                raw_v = eye_vgaze(lm)
-                if raw_v is not None:
-                    vgaze_s = f_vg(raw_v, t0)
+
+                # Vertical eye gaze from the ONNX model. Skip during a blink or on
+                # a strided frame -> vgaze_s holds its last good value, so the
+                # split pick doesn't jump when the eyes are shut or we're saving
+                # CPU. Mirroring the frame flips yaw (which we ignore), not pitch.
+                if not is_blinking(lm) and frame_i % gaze_stride == 0:
+                    x0, y0, x1, y1 = bbox_from_landmarks(lm, w, h)
+                    if (x1 - x0) >= MIN_CROP_PX and (y1 - y0) >= MIN_CROP_PX:
+                        _, gaze_pitch = engine.estimate(frame[y0:y1, x0:x1])
+                        vgaze_s = f_vg(gaze_pitch, t0)
                 recent.append((yaw, pitch, vgaze_s))
 
             zone = classify(yaw, pitch, cfg, zone)
@@ -570,13 +720,13 @@ def main():
                     eye_pts = [(b, c) for (_, b, c) in recent if c is not None]
                     if zone in (0, 1, 2) and eye_pts:
                         slot = "top" if key == ord("t") else "bottom"
-                        ap = sum(p[0] for p in eye_pts) / len(eye_pts)
+                        ap_ = sum(p[0] for p in eye_pts) / len(eye_pts)
                         av = sum(p[1] for p in eye_pts) / len(eye_pts)
                         cfg.setdefault("sub", {}).setdefault(str(zone), {})[slot] = [
-                            round(ap, 4), round(av, 4)]
+                            round(ap_, 4), round(av, 4)]
                         save_config(cfg)
                         print(f"recorded {slot.upper()} window of {ZONE_NAMES[zone]} "
-                              f"(avg of {len(eye_pts)}): pitch={ap:.3f} vgaze={av:.3f}")
+                              f"(avg of {len(eye_pts)}): pitch={ap_:.3f} vgaze={av:.3f}")
                     elif not eye_pts:
                         print("can't record: eyes not detected (blink/lighting).")
                     else:

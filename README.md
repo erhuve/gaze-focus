@@ -6,10 +6,10 @@ pick which one. Two pieces:
 
 - **`head_pose_service.py`** — webcam service. Watches where your head is pointed
   in two axes (left/right turn + up/down tilt) and writes the current zone
-  (`0`=laptop, `1`=top, `2`=right) to `~/.gaze/state.json`. It also reads
-  vertical **eye gaze** from your irises, so once you calibrate a screen's split
-  it emits a continuous `gaze_y` (`0`=top … `1`=bottom). It *never* moves focus
-  on its own.
+  (`0`=laptop, `1`=top, `2`=right) to `~/.gaze/state.json`. It also estimates
+  vertical **eye gaze** with a small neural net (an ONNX gaze model), so once you
+  calibrate a screen's split it emits a continuous `gaze_y` (`0`=top … `1`=bottom).
+  It *never* moves focus on its own.
 - **`gaze.lua`** — Hammerspoon module. On your trigger key (default F13 / Print
   Screen) it reads the zone, focuses the monitor you're pointed at, and — when `gaze_y` is
   live and that screen holds 2+ windows — the exact window at that height. Brief
@@ -30,14 +30,21 @@ are just names.
 
 ```bash
 cd Code/gaze-focus
-python3 -m venv .venv && source .venv/bin/activate
+# onnxruntime + mediapipe ship wheels for Python 3.12 (3.13/3.14 don't have them
+# yet), so create the venv with 3.12:
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python head_pose_service.py
+python head_pose_service.py                      # mobileone_s0 (fast) by default
+# or, for max accuracy at some CPU cost:
+python head_pose_service.py --gaze-model resnet34
 ```
 
 First run macOS will ask for **Camera** access for your terminal — allow it.
-On first launch it also downloads a small (~3.8 MB) face-landmark model to
-`~/.gaze/face_landmarker.task`, so you'll need internet that one time.
+On first launch it downloads two small models to `~/.gaze/`, so you'll need
+internet that one time: the face-landmark model (~3.8 MB) and the ONNX eye-gaze
+model (`mobileone_s0` ≈ 5 MB; `resnet34` ≈ 85 MB if you pick that one). On an
+Apple-silicon Mac the gaze model runs on the Neural Engine via CoreML
+automatically; otherwise it falls back to CPU.
 
 A preview window opens. **Calibrate** — look at each monitor the way you
 naturally would and press its number:
@@ -72,11 +79,14 @@ that monitor:
 
 The vertical bar on the left then shows a live `gaze_y` dot moving as you glance
 up/down. `x` clears that screen's eye calibration. Keep your head fairly steady
-and move your **eyes** between the windows — that's the signal this reads. Eye
-gaze is noisier than head pose, so if the pick feels twitchy, re-record `t`/`b`
-while looking squarely at each window's center.
+and move your **eyes** between the windows — that's the signal this reads. The
+neural gaze model is robust to head turn, but it's still finer than head pose, so
+if the pick feels twitchy, re-record `t`/`b` while looking squarely at each
+window's center.
 
-Other keys: `q` / `ESC` quit. Flags: `--camera N`, `--no-preview`, `--fps N`.
+Other keys: `q` / `ESC` quit. Flags: `--camera N`, `--no-preview`, `--fps N`,
+`--gaze-model {mobileone_s0,resnet18,resnet34}`, `--gaze-stride N` (run the gaze
+net every Nth frame to save CPU; head pose still runs every frame).
 
 ## 2. Install Hammerspoon + the commit trigger
 
@@ -129,17 +139,18 @@ to see the names).
 
 ## Notes & tuning
 
-> **Recalibrate after upgrading.** The head/eye signals were reworked for
-> accuracy (see below), so old calibration is auto-cleared on first run. Just
-> press `1`/`2`/`3` for your monitors again, then `t`/`b` for any split. Hold
-> your gaze on each target for a beat — calibration now averages ~0.4 s of
-> frames instead of a single instant, so a steady look gives a cleaner anchor.
+> **Recalibrate the splits after upgrading.** Eye gaze now uses a neural model
+> instead of a geometric iris ratio, so your old top/bottom (`t`/`b`)
+> calibration is auto-cleared on first run — but your **monitor** calibration
+> (`1`/`2`/`3`) is kept, since head pose is unchanged. Just press `t`/`b` again
+> for each split. Hold your gaze on the target for a beat — calibration averages
+> ~0.4 s of frames, so a steady look gives a cleaner anchor.
 
 - **Head pose for screens, eye gaze for windows:** a single webcam can't reliably
   tell *which of three screens* your pupils point at, but it reads head turn +
   tilt cleanly, and on a spread-out desk you naturally move your head toward each
   screen. *Within* one screen, though, you move your eyes, not your head — so the
-  top/bottom-window pick uses iris position instead. Right tool per scale.
+  top/bottom-window pick uses a neural gaze estimate instead. Right tool per scale.
 - **3D head orientation:** the screen pick uses the model's real 3D head-rotation
   matrix (the direction your face points), not 2D nose-between-cheeks ratios — much
   more stable, and it sharpens the laptop↔top (up/down) distinction in particular.
@@ -152,10 +163,16 @@ to see the names).
   *nearest* calibrated head pose — no hand-tuned thresholds, so it adapts to
   wherever you actually point.
 - **`gaze_y` (window pick):** derived by projecting your current (head-pitch,
-  eye-vertical) onto the line between your calibrated top and bottom samples, so
-  it works whether you move your eyes, tip your head, or both. The eye signal is
-  measured against the rigid eye corners (tracks the eyeball, not the eyelid),
-  smoothed and blink-guarded; Hammerspoon maps it to the window at that height.
+  eye-gaze-pitch) onto the line between your calibrated top and bottom samples, so
+  it works whether you move your eyes, tip your head, or both. The eye-gaze pitch
+  comes from a small appearance-based neural net (an ONNX gaze model trained on
+  Gaze360) run on a crop of your face — robust to head turn, unlike geometric
+  iris ratios — then smoothed and blink-guarded; Hammerspoon maps it to the
+  window at that height.
+- **Gaze model choice:** `--gaze-model mobileone_s0` (default) is the fast pick
+  (~22 ms/frame on CPU, much faster on the Mac's Neural Engine); `resnet34` is the
+  most accurate but heavier. If a slower model drops your frame rate, `--gaze-stride
+  2` runs the gaze net every other frame while head pose keeps running every frame.
 - **Hysteresis** (the stickiness margin) keeps the zone stable near boundaries,
   so it's settled by the time you press the trigger. Tune with `[` / `]`.
 - To swap the trigger to a real **foot pedal** later, map the pedal to whatever
