@@ -1,16 +1,21 @@
 # gaze-focus
 
-Point your head toward a monitor, press a button, and focus jumps to the
-frontmost window on that screen. Two pieces:
+Point your head toward a monitor, press a button, and focus jumps to the window
+on that screen — and if a screen has two windows split top/bottom, your **eyes**
+pick which one. Two pieces:
 
 - **`head_pose_service.py`** — webcam service. Watches where your head is pointed
   in two axes (left/right turn + up/down tilt) and writes the current zone
-  (`0`=laptop, `1`=top, `2`=right) to `~/.gaze/state.json`. It *never* moves
-  focus on its own.
+  (`0`=laptop, `1`=top, `2`=right) to `~/.gaze/state.json`. It also reads
+  vertical **eye gaze** from your irises, so once you calibrate a screen's split
+  it emits a continuous `gaze_y` (`0`=top … `1`=bottom). It *never* moves focus
+  on its own.
 - **`gaze.lua`** — Hammerspoon module. On your trigger (mouse4 or a hotkey) it
-  reads the zone and focuses the window on that monitor, with a brief edge flash.
+  reads the zone, focuses the monitor you're pointed at, and — when `gaze_y` is
+  live and that screen holds 2+ windows — the exact window at that height. Brief
+  cyan flash around whatever it focused.
 
-Head points. The trigger commits. No thrash.
+Head picks the screen. Eyes pick the window. The trigger commits. No thrash.
 
 **Layout it's tuned for:** a laptop on the desk (you look *down*), a monitor
 mounted *above* it (you look *up*), and a monitor off to the *right* (you *turn*).
@@ -50,6 +55,21 @@ re-record it; `r` clears everything.
   leave the current zone), `]` makes it looser.
 - Calibration persists to `~/.gaze/config.json`, so you only do this once.
 
+### Optional: calibrate a screen's top/bottom split (eye gaze)
+
+For any monitor that holds two windows stacked vertically (e.g. the right
+monitor), you can let your eyes pick which one. While the **ZONE** label shows
+that monitor:
+
+1. Look at the **top** window → press **`t`**
+2. Look at the **bottom** window → press **`b`**
+
+The vertical bar on the left then shows a live `gaze_y` dot moving as you glance
+up/down. `x` clears that screen's eye calibration. Keep your head fairly steady
+and move your **eyes** between the windows — that's the signal this reads. Eye
+gaze is noisier than head pose, so if the pick feels twitchy, re-record `t`/`b`
+while looking squarely at each window's center.
+
 Other keys: `q` / `ESC` quit. Flags: `--camera N`, `--no-preview`, `--fps N`.
 
 ## 2. Install Hammerspoon + the commit trigger
@@ -75,8 +95,10 @@ Other keys: `q` / `ESC` quit. Flags: `--camera N`, `--no-preview`, `--fps N`.
 - **⌘⌥⌃G** → same thing via keyboard. Change the binding at the bottom of
   `gaze.lua` to any key/combo you want.
 
-Point your head, tap the trigger, focus follows. The screen edge flashes cyan so
-you get instant "switched here" feedback.
+Point your head, tap the trigger, focus follows. Whatever it focuses (a screen,
+or a single window when eye gaze is live) flashes cyan so you get instant
+"switched here" feedback. On a screen with a calibrated top/bottom split it picks
+the window your eyes are on; otherwise it focuses the frontmost window there.
 
 `gaze.lua` figures out which physical screen each zone is automatically: the
 **right** zone → your rightmost display; of the remaining two, the higher one →
@@ -89,13 +111,19 @@ to see the names).
 
 ## Notes & tuning
 
-- **Why head pose, not eye gaze:** a single webcam can't reliably tell *where*
-  on three screens your pupils point, but it reads head turn + tilt cleanly. On a
-  spread-out desk you naturally move your head toward each screen.
-- **Two axes:** left/right turn (yaw) separates the right monitor; up/down tilt
-  (pitch) separates the laptop from the monitor above it. Each frame is matched
-  to the *nearest* calibrated head pose — no hand-tuned thresholds, so it adapts
-  to wherever you actually point.
+- **Head pose for screens, eye gaze for windows:** a single webcam can't reliably
+  tell *which of three screens* your pupils point at, but it reads head turn +
+  tilt cleanly, and on a spread-out desk you naturally move your head toward each
+  screen. *Within* one screen, though, you move your eyes, not your head — so the
+  top/bottom-window pick uses iris position instead. Right tool per scale.
+- **Two axes (screen pick):** left/right turn (yaw) separates the right monitor;
+  up/down tilt (pitch) separates the laptop from the monitor above it. Each frame
+  is matched to the *nearest* calibrated head pose — no hand-tuned thresholds, so
+  it adapts to wherever you actually point.
+- **`gaze_y` (window pick):** derived by projecting your current (head-pitch,
+  eye-vertical) onto the line between your calibrated top and bottom samples, so
+  it works whether you move your eyes, tip your head, or both. Smoothed and
+  blink-guarded; Hammerspoon maps it to the window at that height on the screen.
 - **Hysteresis** (the stickiness margin) keeps the zone stable near boundaries,
   so it's settled by the time you press the trigger. Tune with `[` / `]`.
 - To swap the trigger to a real **foot pedal** later, just map the pedal to

@@ -1,8 +1,10 @@
 -- gaze-focus: commit side of the head-pose window switcher.
 -- The Python service keeps ~/.gaze/state.json updated with the current zone:
 --   0 = LAPTOP   1 = TOP monitor   2 = RIGHT monitor
--- This reads that zone on a trigger and focuses the frontmost window on the
--- matching physical screen.
+-- and, when a screen's split is eye-calibrated, a continuous "gaze_y" in [0,1]
+-- (0 = top, 1 = bottom) for where your eyes are within that screen.
+-- On a trigger this focuses the matching physical screen -- and if gaze_y is
+-- present and the screen holds 2+ windows, the exact window at that height.
 --
 -- Triggers wired up below:
 --   * mouse4 (the "back" thumb button) -- no remapping needed
@@ -91,50 +93,82 @@ local function readState()
   f:close()
   local zone = content:match('"zone"%s*:%s*(%-?%d+)')
   local ts = content:match('"ts"%s*:%s*([%d%.]+)')
+  -- gaze_y is null when the active screen has no eye calibration -> no match.
+  local gy = content:match('"gaze_y"%s*:%s*(%-?[%d%.]+)')
   if not zone then return nil end
-  return tonumber(zone), tonumber(ts)
+  return tonumber(zone), tonumber(ts), tonumber(gy)
 end
 
-local function flashScreen(screen)
-  local frame = screen:fullFrame()
-  local c = hs.canvas.new(frame)
+-- Flash a cyan outline around any rect (a whole screen, or a single window).
+local function flashFrame(rect)
+  local c = hs.canvas.new(rect)
   c:appendElements({
     type = "rectangle",
     action = "stroke",
     strokeColor = { red = 0.23, green = 0.86, blue = 1.0, alpha = 0.95 },
-    strokeWidth = 10,
-    roundedRectRadii = { xRadius = 12, yRadius = 12 },
-    frame = { x = 0, y = 0, w = frame.w, h = frame.h },
+    strokeWidth = 8,
+    roundedRectRadii = { xRadius = 10, yRadius = 10 },
+    frame = { x = 0, y = 0, w = rect.w, h = rect.h },
   })
   c:show()
   hs.timer.doAfter(FLASH_SECONDS, function() c:delete() end)
 end
 
-local function focusZone(zone)
+-- Pick the window on `target` whose vertical position best matches gazeY.
+-- gazeY in [0,1]: 0 = topmost window, 1 = bottommost. Returns nil if there
+-- aren't enough windows or no gaze signal -- caller falls back to frontmost.
+local function windowAtGaze(wins, gazeY)
+  if gazeY == nil or #wins < 2 then return nil end
+  local minC, maxC = math.huge, -math.huge
+  for _, w in ipairs(wins) do
+    local f = w:frame()
+    local c = f.y + f.h / 2
+    if c < minC then minC = c end
+    if c > maxC then maxC = c end
+  end
+  local span = maxC - minC
+  if span < 1 then return nil end -- windows stacked, can't separate vertically
+  local best, bestErr = nil, math.huge
+  for _, w in ipairs(wins) do
+    local f = w:frame()
+    local norm = (f.y + f.h / 2 - minC) / span
+    local err = math.abs(norm - gazeY)
+    if err < bestErr then bestErr = err; best = w end
+  end
+  return best
+end
+
+local function focusZone(zone, gazeY)
   if not zone or zone < 0 or zone > 2 then return end
   local target = resolveScreens()[zone]
   if not target then return end
 
-  -- frontmost standard window on the target screen
+  -- visible standard windows on the target screen, front-to-back
+  local wins = {}
   for _, w in ipairs(hs.window.orderedWindows()) do
     if w:screen():id() == target:id() and w:isStandard() then
-      w:focus()
-      flashScreen(target)
-      return
+      wins[#wins + 1] = w
     end
   end
-  -- no window there; still flash so you get feedback
-  flashScreen(target)
+
+  if #wins == 0 then
+    flashFrame(target:fullFrame()) -- nothing there; still flash for feedback
+    return
+  end
+
+  local pick = windowAtGaze(wins, gazeY) or wins[1] -- gaze, else frontmost
+  pick:focus()
+  flashFrame(pick:frame())
 end
 
 local function commit()
-  local zone, ts = readState()
+  local zone, ts, gy = readState()
   if zone == nil then return end
   if ts and (os.time() - ts) > STALE_SECONDS then
     hs.alert.show("gaze: pose service not running?")
     return
   end
-  focusZone(zone)
+  focusZone(zone, gy)
 end
 
 -- Hotkey trigger (change the mods/key to taste)
