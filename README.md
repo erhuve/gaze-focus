@@ -86,7 +86,9 @@ window's center.
 
 Other keys: `q` / `ESC` quit. Flags: `--camera N`, `--no-preview`, `--fps N`,
 `--gaze-model {mobileone_s0,resnet18,resnet34}`, `--gaze-stride N` (run the gaze
-net every Nth frame to save CPU; head pose still runs every frame).
+net every Nth frame to save CPU; head pose still runs every frame), `--auto-focus`
+(hands-free dwell focus — see [Use it](#3-use-it)), `--auto-focus-seconds N`
+(dwell time, default 3).
 
 ## 2. Install Hammerspoon + the commit trigger
 
@@ -114,6 +116,24 @@ net every Nth frame to save CPU; head pose still runs every frame).
 - **Not sure what your key sends?** Press **⌘⌥⌃K** to turn on the key detector,
   tap the key, and an alert shows its name + keycode — put that in `TRIGGER_KEY`.
 - **⌘⌥⌃G** → same commit via a keyboard chord, always available as a backup.
+
+### Optional: hands-free dwell auto-focus
+
+Don't want to press anything? Start the service with `--auto-focus`:
+
+```bash
+python head_pose_service.py --auto-focus                 # 3-second dwell
+python head_pose_service.py --auto-focus --auto-focus-seconds 2   # tune it
+```
+
+Now if your gaze settles on the same window (one that isn't already focused) for
+**3 seconds** (or whatever you set), focus commits on its own — same cyan flash,
+no key press. The amber preview outline shows the window it's about to switch to,
+so glancing away before the dwell completes cancels it. Off unless you pass the
+flag, and the manual trigger keeps working alongside it. (Under the hood the
+flag just writes `auto_focus` into `~/.gaze/state.json`; Hammerspoon reads it and
+does the dwell, so toggling it is as simple as restarting the service with or
+without `--auto-focus`.)
 
 Point your head, tap the trigger, focus follows. Whatever it focuses (a screen,
 or a single window when eye gaze is live) flashes cyan so you get instant
@@ -177,5 +197,8 @@ to see the names).
   so it's settled by the time you press the trigger. Tune with `[` / `]`.
 - To swap the trigger to a real **foot pedal** later, map the pedal to whatever
   key you set in `TRIGGER_KEY` (or to ⌘⌥⌃G) and you're done — no code change.
-- Want focus to follow automatically without a trigger? That's the thrashy mode
-  we deliberately avoided, but it's a few lines if you change your mind.
+- **Dwell auto-focus** (`--auto-focus`) gives you trigger-free switching without
+  the thrash of true focus-follows-gaze: it only commits after your gaze *holds*
+  on one window for `--auto-focus-seconds` (default 3 s), so passing glances never
+  move focus. Enable it by launching the service with the flag; no Hammerspoon
+  edit needed.
