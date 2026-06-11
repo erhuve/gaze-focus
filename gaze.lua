@@ -15,6 +15,8 @@
 --   * hotkey  cmd+alt+ctrl+G  -- commit / focus the candidate (backup)
 --   * hotkey  cmd+alt+ctrl+P  -- toggle the live candidate preview
 --   * hotkey  cmd+alt+ctrl+K  -- toggle the key detector (find a key's name)
+-- Hands-free dwell auto-focus (commit by just looking, no key) is opt-in: start
+-- the Python service with --auto-focus. We read that from state.json (below).
 --
 -- Install: put this file at ~/.hammerspoon/gaze.lua and add this line to
 -- ~/.hammerspoon/init.lua:   require("gaze")
@@ -107,8 +109,12 @@ local function readState()
   local ts = content:match('"ts"%s*:%s*([%d%.]+)')
   -- gaze_y is null when the active screen has no eye calibration -> no match.
   local gy = content:match('"gaze_y"%s*:%s*(%-?[%d%.]+)')
+  -- Hands-free dwell focus, set by the service's --auto-focus flag (absent on
+  -- older builds -> treated as off).
+  local af = content:match('"auto_focus"%s*:%s*(%a+)')
+  local afs = content:match('"auto_focus_seconds"%s*:%s*([%d%.]+)')
   if not zone then return nil end
-  return tonumber(zone), tonumber(ts), tonumber(gy)
+  return tonumber(zone), tonumber(ts), tonumber(gy), af == "true", tonumber(afs)
 end
 
 -- Flash a cyan outline around any rect (a whole screen, or a single window).
@@ -224,25 +230,47 @@ local function commit()
   focusZone(zone, gy)
 end
 
--- Live preview tick: outline the candidate window, but only when it isn't the
--- one already focused (no point previewing where you already are).
-local function updatePreview()
-  if not PREVIEW_ENABLED then hidePreview(); return end
-  local zone, ts, gy = readState()
+-- ── Dwell auto-focus ────────────────────────────────────────────────────────
+-- Optional hands-free mode: instead of tapping the trigger, just keep looking.
+-- If the candidate window stays the same (and isn't already focused) for the
+-- dwell time, focus commits on its own. This is driven entirely by the Python
+-- service: run it with `--auto-focus` (optionally `--auto-focus-seconds N`) and
+-- it writes auto_focus / auto_focus_seconds into state.json, which we read each
+-- tick. No flag -> auto-focus stays off and only the manual trigger commits.
+local AUTO_FOCUS_DEFAULT_SECONDS = 3.0 -- fallback if state.json omits the seconds
+
+local dwellWinId, dwellStart = nil, nil -- which candidate we're dwelling on, since when
+local function resetDwell() dwellWinId, dwellStart = nil, nil end
+
+-- Per-tick: keep the live candidate preview in sync AND, when the service has
+-- auto-focus on, track how long you've held the same unfocused candidate and
+-- commit once it crosses the dwell threshold. One candidate read feeds both.
+local function tick()
+  local zone, ts, gy, autoFocus, autoSecs = readState()
   if zone == nil or (ts and (os.time() - ts) > STALE_SECONDS) then
-    hidePreview(); return
+    hidePreview(); resetDwell(); return
   end
   local pick = candidate(zone, gy)
-  if not pick then hidePreview(); return end
+  if not pick then hidePreview(); resetDwell(); return end
+
   local focused = hs.window.focusedWindow()
-  if focused and pick:id() == focused:id() then
-    hidePreview() -- already focused; nothing to preview
-  else
-    showPreview(pick)
+  local alreadyFocused = focused and pick:id() == focused:id()
+
+  -- Live preview: outline the candidate unless it's already where focus is.
+  if PREVIEW_ENABLED and not alreadyFocused then showPreview(pick) else hidePreview() end
+
+  -- Dwell only counts on an unfocused candidate, and only when --auto-focus is on.
+  if not autoFocus or alreadyFocused then resetDwell(); return end
+  local now = hs.timer.secondsSinceEpoch()
+  if pick:id() ~= dwellWinId then
+    dwellWinId, dwellStart = pick:id(), now -- candidate changed; restart the clock
+  elseif now - dwellStart >= (autoSecs or AUTO_FOCUS_DEFAULT_SECONDS) then
+    focusZone(zone, gy) -- held long enough -- commit, then wait for the next look
+    resetDwell()
   end
 end
 
-M.previewTimer = hs.timer.doEvery(1.0 / PREVIEW_HZ, updatePreview)
+M.previewTimer = hs.timer.doEvery(1.0 / PREVIEW_HZ, tick)
 
 -- Toggle the live candidate preview on/off.
 hs.hotkey.bind({ "cmd", "alt", "ctrl" }, "p", function()

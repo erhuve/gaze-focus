@@ -41,10 +41,12 @@ whenever that screen is the active zone. Hammerspoon uses gaze_y to focus the
 exact window at that height. This works for any vertical split (2, 3, ...
 windows), not just two.
 
-It NEVER changes window focus. It just keeps the current zone (and, when
-calibrated, gaze_y) live. The commit (actually switching focus) is done by
-Hammerspoon when you press your trigger (mouse4 or a hotkey). Eyes point, the
-trigger commits.
+It NEVER changes window focus itself. It just keeps the current zone (and, when
+calibrated, gaze_y) live -- plus, if you pass --auto-focus, a flag in the state
+file telling Hammerspoon to commit hands-free. The commit (actually switching
+focus) is done by Hammerspoon: when you press your trigger (a key or hotkey), or
+-- with --auto-focus -- automatically once you've dwelt on a window for
+--auto-focus-seconds (default 3). Eyes point, the trigger (or a steady look) commits.
 
 Live keys in the preview window:
     1  -> ADD a LAPTOP-monitor pose sample (press again from other postures)
@@ -283,7 +285,8 @@ def reconcile_version(cfg):
     return True
 
 
-def write_state(zone, yaw, pitch, vgaze, gaze_y, has_sub):
+def write_state(zone, yaw, pitch, vgaze, gaze_y, has_sub,
+                auto_focus=False, auto_focus_seconds=3.0):
     os.makedirs(GAZE_DIR, exist_ok=True)
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w") as f:
@@ -295,6 +298,10 @@ def write_state(zone, yaw, pitch, vgaze, gaze_y, has_sub):
                 "vgaze": round(float(vgaze), 4) if vgaze is not None else None,
                 "gaze_y": round(float(gaze_y), 4) if gaze_y is not None else None,
                 "has_sub": bool(has_sub),
+                # Hands-free dwell focus, driven by the --auto-focus flag. Hammerspoon
+                # reads these and commits focus to a steadily-looked-at window.
+                "auto_focus": bool(auto_focus),
+                "auto_focus_seconds": round(float(auto_focus_seconds), 3),
                 "ts": time.time(),
             },
             f,
@@ -592,6 +599,13 @@ def main():
     ap.add_argument("--gaze-stride", type=int, default=1,
                     help="run the gaze model every Nth frame (raise to save CPU; "
                          "head pose still runs every frame)")
+    ap.add_argument("--auto-focus", action="store_true",
+                    help="hands-free dwell focus: Hammerspoon commits focus to a "
+                         "window once you've looked at it steadily for the dwell "
+                         "time -- no trigger press needed (off by default)")
+    ap.add_argument("--auto-focus-seconds", type=float, default=3.0,
+                    help="dwell time in seconds before --auto-focus commits "
+                         "(default 3)")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -631,6 +645,9 @@ def main():
     frame_i = 0
     min_dt = 1.0 / args.fps if args.fps > 0 else 0.0
     print(f"gaze-focus running. writing -> {STATE_PATH}")
+    if args.auto_focus:
+        print(f"auto-focus ON: focus commits after a steady "
+              f"{args.auto_focus_seconds:.1f}s look (no trigger needed).")
     if len(cfg["points"]) < 3:
         print("Not calibrated yet. Look at each monitor and press 1=laptop, 2=top, 3=right.")
     else:
@@ -682,7 +699,8 @@ def main():
                     GY_ALPHA * gy + (1.0 - GY_ALPHA) * gaze_y_s)
             else:
                 gaze_y_s = None
-            write_state(zone, yaw, pitch, vgaze_s, gaze_y_s, has_sub(zone, cfg))
+            write_state(zone, yaw, pitch, vgaze_s, gaze_y_s, has_sub(zone, cfg),
+                        args.auto_focus, args.auto_focus_seconds)
 
             if not args.no_preview:
                 draw_overlay(frame, yaw, pitch, cfg, zone, vgaze_s, gaze_y_s)
